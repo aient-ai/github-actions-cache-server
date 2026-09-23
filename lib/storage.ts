@@ -1,11 +1,9 @@
 /* eslint-disable ts/method-signature-style */
 import type { Kysely } from 'kysely'
-import type { ReadableStream } from 'node:stream/web'
 import type { Database, StorageLocation } from './db'
 import type { ByteRange, RangeRequest } from './ranged-download'
 import type { Env } from './schemas'
 import { randomUUID } from 'node:crypto'
-import { once } from 'node:events'
 import { createReadStream, createWriteStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import { Agent } from 'node:https'
@@ -52,6 +50,19 @@ import { deleteStorageLocationIfUnread, noActiveReaderLease } from './storage-li
 // Bounds the self-heal retry when matching keeps surfacing Dangling Cache
 // Entries for the same prefix — caps a pathological scan (ADR-0005).
 const MAX_DANGLING_PURGE_ATTEMPTS = 10
+
+/** Resolves when a full writable can take more data, or can take none ever again. */
+function writableOrClosed(stream: PassThrough) {
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      stream.off('drain', done)
+      stream.off('close', done)
+      resolve()
+    }
+    stream.on('drain', done)
+    stream.on('close', done)
+  })
+}
 
 function escapeLikePattern(value: string) {
   return value
@@ -174,6 +185,12 @@ export class Storage {
     return { stream, totalBytes, range }
   }
 
+  /**
+   * Feeds each Part chunk to the client response and the merge upload at the
+   * pace of the slower one. A sink that closes early is dropped, so a client
+   * abort does not cancel the merge and a failed merge does not cut off the
+   * client; reading stops once both are gone.
+   */
   private async pumpPartsToStreams(
     location: StorageLocation,
     responseStream: PassThrough,
@@ -181,18 +198,15 @@ export class Storage {
   ) {
     if (location.partsDeletedAt) throw new Error('No parts to feed')
 
+    const sinks = [responseStream, mergerStream]
     for await (const chunk of this.streamParts(location)) {
-      // attach both drain listeners simultaneously to prevent a race condition where the second stream being faster hangs forever
-      const drains = []
-      if (!responseStream.write(chunk)) drains.push(once(responseStream, 'drain'))
-      if (!mergerStream.write(chunk)) drains.push(once(mergerStream, 'drain'))
-      await Promise.all(drains)
+      const live = sinks.filter((sink) => !sink.destroyed)
+      if (live.length === 0) return
+      // wait on every full sink at once: awaiting them in turn can miss the second one's `drain`
+      await Promise.all(live.filter((sink) => !sink.write(chunk)).map(writableOrClosed))
     }
 
-    responseStream.end()
-    mergerStream.end()
-
-    await globalThis.gc?.()
+    for (const sink of sinks) if (!sink.destroyed) sink.end()
   }
 
   private async *streamParts(location: StorageLocation) {
@@ -204,8 +218,6 @@ export class Storage {
       )
 
       for await (const chunk of partStream) yield chunk
-
-      await globalThis.gc?.()
     }
   }
 
@@ -360,7 +372,7 @@ export class Storage {
     return Promise.all(this.mergeStreamPromises)
   }
 
-  async uploadPart(uploadId: number, partIndex: number, stream: ReadableStream) {
+  async uploadPart(uploadId: number, partIndex: number, stream: Readable) {
     const upload = await this.db
       .selectFrom('uploads')
       .where('id', '=', uploadId)
@@ -376,10 +388,7 @@ export class Storage {
       .where('id', '=', uploadId)
       .execute()
 
-    await this.adapter.uploadStream(
-      `${upload.folderName}/parts/${partIndex}`,
-      Readable.fromWeb(stream),
-    )
+    await this.adapter.uploadStream(`${upload.folderName}/parts/${partIndex}`, stream)
 
     await this.db
       .updateTable('uploads')

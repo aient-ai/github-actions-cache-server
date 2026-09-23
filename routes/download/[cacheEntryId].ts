@@ -1,4 +1,6 @@
-import { Readable } from 'node:stream'
+import type { ServerResponse } from 'node:http'
+import type { Readable } from 'node:stream'
+import { finished } from 'node:stream'
 import { z } from 'zod'
 import { logger } from '~/lib/logger'
 import { parseRangeHeader, RangeNotSatisfiableError } from '~/lib/ranged-download'
@@ -48,8 +50,9 @@ export default defineEventHandler(async (event) => {
     }
   }
 
+  const res = event.node.res
   try {
-    await sendStream(event, Readable.toWeb(stream) as ReadableStream)
+    await pipeToResponse(stream, res)
   } catch (err) {
     // Once the response has started flushing, we can't surface stream errors
     // as an HTTP error — Nitro's default error handler would call
@@ -57,12 +60,38 @@ export default defineEventHandler(async (event) => {
     // ERR_HTTP_HEADERS_SENT (logged as an unhandled error). Client aborts on
     // long downloads are expected (cancelled jobs, parallel runners), so we
     // log and swallow once headers are out.
-    if (event.node.res.headersSent) {
+    if (res.headersSent) {
+      // a truncated body must not look like a stalled one to the client
+      res.destroy()
       if (event.node.req.destroyed)
         logger.debug(`Client aborted /download/${cacheEntryId}: ${(err as Error).message}`)
       else logger.error(`Download stream failed for ${cacheEntryId}`, { error: err })
       return
     }
+    for (const header of ['accept-ranges', 'content-length', 'content-range'])
+      res.removeHeader(header)
     throw err
   }
 })
+
+/**
+ * Pipes `stream` into the response at the pace the client reads it. h3's
+ * `sendStream` ignores `res.write`'s return value for web streams, so a slow
+ * client made the server buffer the whole object, and for Node streams it
+ * never destroys the source when the client goes away.
+ */
+function pipeToResponse(stream: Readable, res: ServerResponse) {
+  return new Promise<void>((resolve, reject) => {
+    res.once('finish', resolve)
+    res.once('close', () => {
+      // destroying the source aborts its storage reads and releases its lease
+      if (!res.writableFinished) stream.destroy(new Error('Client closed the connection'))
+    })
+    finished(stream, { writable: false }, (err) => {
+      if (!err) return
+      stream.unpipe(res)
+      reject(err)
+    })
+    stream.pipe(res)
+  })
+}
