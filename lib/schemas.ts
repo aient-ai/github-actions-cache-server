@@ -70,6 +70,8 @@ export const envBaseSchema = type({
   'DEBUG?': 'unknown',
   'ENABLE_DIRECT_DOWNLOADS': 'boolean = false',
   'EAGER_MERGE': 'boolean = false',
+  'DOWNLOAD_CONCURRENCY': 'number.integer >= 1 = 1',
+  'DOWNLOAD_CHUNK_BYTES': 'number.integer >= 65536 = 8388608',
   'BENCHMARK': 'boolean = false',
   'SKIP_TOKEN_VALIDATION': 'boolean = false',
   'MANAGEMENT_API_KEY?': 'string',

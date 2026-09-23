@@ -2,6 +2,7 @@
 import type { Kysely } from 'kysely'
 import type { ReadableStream } from 'node:stream/web'
 import type { Database, StorageLocation } from './db'
+import type { ByteRange, RangeRequest } from './ranged-download'
 import type { Env } from './schemas'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
@@ -35,6 +36,7 @@ import { getDatabase, retryOnLockConflict } from './db'
 import { env } from './env'
 import { generateNumberId } from './helpers'
 import { logger } from './logger'
+import { createParallelRangeStream, resolveRange } from './ranged-download'
 import {
   acquireMergeLease,
   createReaderLease,
@@ -63,6 +65,14 @@ export class ObjectNotFoundError extends Error {
     super(`Object not found in storage: ${objectName}`)
     this.name = 'ObjectNotFoundError'
   }
+}
+
+export interface CacheDownload {
+  stream: Readable
+  /** Size of the whole stored object, when the backend can report it. */
+  totalBytes?: number
+  /** The satisfied part of a `Range` request; absent for a full response. */
+  range?: ByteRange
 }
 
 export class Storage {
@@ -133,11 +143,35 @@ export class Storage {
     if (actualPartCount < location.partCount) throw new ObjectNotFoundError(partsFolder)
   }
 
-  private async downloadFromCacheEntryLocation(location: StorageLocation) {
-    if (location.mergedAt) return this.adapter.createDownloadStream(`${location.folderName}/merged`)
-
+  private async downloadParts(location: StorageLocation) {
     await this.ensurePartsExist(location)
     return Readable.from(this.streamParts(location))
+  }
+
+  /**
+   * Opens a stored object, or the requested range of it. Spans larger than one
+   * `DOWNLOAD_CHUNK_BYTES` window are read as `DOWNLOAD_CONCURRENCY` parallel
+   * ranged requests and streamed in order.
+   */
+  private async downloadObject(
+    objectName: string,
+    rangeRequest?: RangeRequest,
+  ): Promise<CacheDownload> {
+    const adapter = this.adapter
+    if (!adapter.getObjectSize) return { stream: await adapter.createDownloadStream(objectName) }
+
+    const totalBytes = await adapter.getObjectSize(objectName)
+    const range = rangeRequest && resolveRange(rangeRequest, totalBytes)
+    const span = range ?? { start: 0, end: totalBytes - 1 }
+    const stream =
+      env.DOWNLOAD_CONCURRENCY > 1 && span.end - span.start + 1 > env.DOWNLOAD_CHUNK_BYTES
+        ? createParallelRangeStream(
+            (window) => adapter.createDownloadStream(objectName, window),
+            span,
+            { concurrency: env.DOWNLOAD_CONCURRENCY, chunkBytes: env.DOWNLOAD_CHUNK_BYTES },
+          )
+        : await adapter.createDownloadStream(objectName, range)
+    return { stream, totalBytes, range }
   }
 
   private async pumpPartsToStreams(
@@ -524,7 +558,14 @@ export class Storage {
     }
   }
 
-  async download(cacheEntryId: string): Promise<Readable | undefined> {
+  /**
+   * Opens a Cache Entry for download. A `Range` is honoured for merged entries;
+   * an entry still stored as Parts is always returned whole.
+   */
+  async download(
+    cacheEntryId: string,
+    rangeRequest?: RangeRequest,
+  ): Promise<CacheDownload | undefined> {
     const protectedLocation = await this.db.transaction().execute(async (tx) => {
       let query = tx
         .selectFrom('storage_locations')
@@ -551,8 +592,11 @@ export class Storage {
 
     try {
       if (storageLocation.mergedAt) {
-        const stream = await this.downloadFromCacheEntryLocation(storageLocation)
-        return this.protectDownloadStream(stream, readerLeaseId)
+        const download = await this.downloadObject(
+          `${storageLocation.folderName}/merged`,
+          rangeRequest,
+        )
+        return { ...download, stream: this.protectDownloadStream(download.stream, readerLeaseId) }
       }
 
       await this.ensurePartsExist(storageLocation)
@@ -568,8 +612,8 @@ export class Storage {
           }),
       )
       if (!merge) {
-        const stream = await this.downloadFromCacheEntryLocation(storageLocation)
-        return this.protectDownloadStream(stream, readerLeaseId)
+        const stream = await this.downloadParts(storageLocation)
+        return { stream: this.protectDownloadStream(stream, readerLeaseId) }
       }
 
       this.pumpPartsToStreams(storageLocation, responseStream, mergerStream).catch((err) => {
@@ -579,7 +623,7 @@ export class Storage {
           logger.warn(`Stale cache entry ${cacheEntryId}: ${err.message}`)
       })
 
-      return this.protectDownloadStream(responseStream, readerLeaseId)
+      return { stream: this.protectDownloadStream(responseStream, readerLeaseId) }
     } catch (err) {
       await releaseReaderLease(this.db, readerLeaseId)
       if (err instanceof ObjectNotFoundError) {
@@ -789,7 +833,13 @@ export class Storage {
 export const getStorage = createSingletonPromise(async () => Storage.fromEnv())
 
 export interface StorageAdapter {
-  createDownloadStream(objectName: string): Promise<Readable>
+  /** Streams an object, or only the inclusive byte `range` of it. */
+  createDownloadStream(objectName: string, range?: ByteRange): Promise<Readable>
+  /**
+   * Size of a stored object in bytes. Adapters implementing it serve `Range`
+   * requests, report `Content-Length`, and read large objects in parallel.
+   */
+  getObjectSize?(objectName: string): Promise<number>
   /**
    * Uploads must be atomically visible: an object never exists partially, and
    * overwriting an object never disturbs active readers of the previous
@@ -995,12 +1045,13 @@ class S3Adapter implements StorageAdapter {
     return deleted
   }
 
-  async createDownloadStream(objectName: string) {
+  async createDownloadStream(objectName: string, range?: ByteRange) {
     try {
       const response = await this.s3.send(
         new GetObjectCommand({
           Bucket: this.bucket,
           Key: `${this.keyPrefix}/${objectName}`,
+          Range: range && `bytes=${range.start}-${range.end}`,
         }),
       )
       if (!response.Body) throw new Error('No body in S3 get object response')
@@ -1008,6 +1059,24 @@ class S3Adapter implements StorageAdapter {
       return response.Body as Readable
     } catch (err: any) {
       if (err.name === 'NoSuchKey') throw new ObjectNotFoundError(objectName)
+      throw err
+    }
+  }
+
+  async getObjectSize(objectName: string) {
+    try {
+      const response = await this.s3.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: `${this.keyPrefix}/${objectName}`,
+        }),
+      )
+      if (response.ContentLength === undefined)
+        throw new Error(`S3 did not return a size for object "${objectName}"`)
+      return response.ContentLength
+    } catch (err: any) {
+      if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404)
+        throw new ObjectNotFoundError(objectName)
       throw err
     }
   }
@@ -1160,14 +1229,24 @@ class FileSystemAdapter implements StorageAdapter {
     return folder
   }
 
-  async createDownloadStream(objectName: string) {
+  async createDownloadStream(objectName: string, range?: ByteRange) {
     const filePath = this.safePath(objectName)
     try {
       await fs.access(filePath)
     } catch {
       throw new ObjectNotFoundError(objectName)
     }
-    return createReadStream(filePath)
+    return createReadStream(filePath, range)
+  }
+
+  async getObjectSize(objectName: string) {
+    try {
+      const stat = await fs.stat(this.safePath(objectName))
+      return stat.size
+    } catch (err: any) {
+      if (err.code === 'ENOENT') throw new ObjectNotFoundError(objectName)
+      throw err
+    }
   }
 
   async objectExists(objectName: string) {
@@ -1317,11 +1396,21 @@ class GcsAdapter implements StorageAdapter {
     this.bucket = gcs.bucket(bucket)
   }
 
-  async createDownloadStream(objectName: string) {
+  async createDownloadStream(objectName: string, range?: ByteRange) {
     const file = this.bucket.file(`${this.keyPrefix}/${objectName}`)
     const [exists] = await file.exists()
     if (!exists) throw new ObjectNotFoundError(objectName)
-    return file.createReadStream()
+    return file.createReadStream(range && { start: range.start, end: range.end })
+  }
+
+  async getObjectSize(objectName: string) {
+    try {
+      const [metadata] = await this.bucket.file(`${this.keyPrefix}/${objectName}`).getMetadata()
+      return Number(metadata.size)
+    } catch (err: any) {
+      if (err.code === 404) throw new ObjectNotFoundError(objectName)
+      throw err
+    }
   }
 
   async objectExists(objectName: string) {
