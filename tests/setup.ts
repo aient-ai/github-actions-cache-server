@@ -35,6 +35,9 @@ const TESTING_ENV_BASE = {
   ACTIONS_RESULTS_URL: 'http://localhost:3000/',
   ACTIONS_CACHE_URL: 'http://localhost:3000/',
   SKIP_TOKEN_VALIDATION: 'true',
+  // small windows so every download larger than 1 MiB takes the parallel path
+  DOWNLOAD_CONCURRENCY: '4',
+  DOWNLOAD_CHUNK_BYTES: '1048576',
 } satisfies Omit<
   typeof envBaseSchema.infer,
   | 'CACHE_CLEANUP_OLDER_THAN_DAYS'
@@ -42,6 +45,8 @@ const TESTING_ENV_BASE = {
   | 'ORPHANED_STORAGE_GRACE_PERIOD_HOURS'
   | 'ENABLE_DIRECT_DOWNLOADS'
   | 'EAGER_MERGE'
+  | 'DOWNLOAD_CONCURRENCY'
+  | 'DOWNLOAD_CHUNK_BYTES'
   | 'BENCHMARK'
   | 'SKIP_TOKEN_VALIDATION'
   | 'ACTIONS_TOKEN_ISSUER'

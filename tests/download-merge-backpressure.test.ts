@@ -18,6 +18,37 @@ function pacedSink(delayMs: number, onByte: (n: number) => void) {
 // different rates, awaiting their `drain` events sequentially can miss the
 // second stream's `drain` (it fires while parked on the first), deadlocking the
 // pump — the client hangs forever mid-download and the merge never completes.
+const PART_COUNT = 3
+const PART_BYTES = 512 * 1024
+const TOTAL_BYTES = PART_COUNT * PART_BYTES
+const location = { folderName: 'x', partCount: PART_COUNT, mergedAt: null, partsDeletedAt: null }
+
+function pump() {
+  const adapter = {
+    createDownloadStream() {
+      const buf = Buffer.alloc(PART_BYTES, 1)
+      function* chunked() {
+        for (let o = 0; o < buf.length; o += 64 * 1024) yield buf.subarray(o, o + 64 * 1024)
+      }
+      return Promise.resolve(Readable.from(chunked()))
+    },
+  } as unknown as StorageAdapter
+  const storage = new (Storage as any)({ db: {}, adapter }) as {
+    pumpPartsToStreams: (loc: unknown, r: PassThrough, m: PassThrough) => Promise<void>
+  }
+  const responseStream = new PassThrough({ highWaterMark: 16 * 1024 })
+  const mergerStream = new PassThrough({ highWaterMark: 16 * 1024 })
+  return {
+    responseStream,
+    mergerStream,
+    run: () =>
+      Promise.race([
+        storage.pumpPartsToStreams(location, responseStream, mergerStream).then(() => 'done'),
+        new Promise<'timeout'>((res) => setTimeout(res, 5000, 'timeout')),
+      ]),
+  }
+}
+
 describe('download merge backpressure', () => {
   test('does not deadlock when the two sinks drain at different rates', async () => {
     const PART_COUNT = 3
@@ -64,5 +95,28 @@ describe('download merge backpressure', () => {
     expect(result).toBe('done')
     expect(responseBytes).toBe(total)
     expect(mergerBytes).toBe(total)
+  })
+
+  test('keeps feeding the merge after the client goes away', async () => {
+    const { responseStream, mergerStream, run } = pump()
+    let mergerBytes = 0
+    mergerStream.pipe(pacedSink(1, (n) => (mergerBytes += n)))
+    // the client reads one chunk and disconnects; nothing drains the response again
+    responseStream.once('data', () => responseStream.destroy())
+
+    expect(await run()).toBe('done')
+    await new Promise((r) => setTimeout(r, 100))
+    expect(mergerBytes).toBe(TOTAL_BYTES)
+  })
+
+  test('keeps serving the client after the merge upload fails', async () => {
+    const { responseStream, mergerStream, run } = pump()
+    let responseBytes = 0
+    responseStream.pipe(pacedSink(1, (n) => (responseBytes += n)))
+    mergerStream.once('data', () => mergerStream.destroy())
+
+    expect(await run()).toBe('done')
+    await new Promise((r) => setTimeout(r, 100))
+    expect(responseBytes).toBe(TOTAL_BYTES)
   })
 })

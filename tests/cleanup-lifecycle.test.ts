@@ -1,4 +1,3 @@
-import type { ReadableStream as NodeReadableStream } from 'node:stream/web'
 import { randomUUID } from 'node:crypto'
 import { Readable } from 'node:stream'
 
@@ -95,11 +94,7 @@ describe('cleanup lifecycle', () => {
       scope: 'refs/heads/main',
       repoId: '123',
     })
-    await storage.uploadPart(
-      upload!.id,
-      0,
-      Readable.toWeb(Readable.from('payload')) as NodeReadableStream,
-    )
+    await storage.uploadPart(upload!.id, 0, Readable.from('payload'))
     const deleteFolder = vi
       .spyOn(storage.adapter, 'deleteFolder')
       .mockRejectedValue(new Error('no'))
@@ -245,8 +240,10 @@ describe('cleanup lifecycle', () => {
       .execute()
 
     try {
-      const mergingDownload = await storage.download(entryId)
-      const activePartsDownload = await storage.download(entryId)
+      const mergingDownload = await storage.download(entryId).then((download) => download?.stream)
+      const activePartsDownload = await storage
+        .download(entryId)
+        .then((download) => download?.stream)
       expect(mergingDownload).toBeDefined()
       expect(activePartsDownload).toBeDefined()
       for await (const _chunk of mergingDownload!) void _chunk
@@ -267,7 +264,7 @@ describe('cleanup lifecycle', () => {
         { timeout: 5000, interval: 100 },
       )
 
-      const mergedDownload = await storage.download(entryId)
+      const mergedDownload = await storage.download(entryId).then((download) => download?.stream)
       expect(mergedDownload).toBeDefined()
       let restored = ''
       for await (const chunk of mergedDownload!) restored += chunk.toString()
@@ -312,7 +309,7 @@ describe('cleanup lifecycle', () => {
       })
       .execute()
 
-    const download = await storage.download(entryId)
+    const download = await storage.download(entryId).then((download) => download?.stream)
     expect(download).toBeDefined()
     await db.deleteFrom('cache_entries').where('id', '=', entryId).execute()
     const taskModule = await import('~/tasks/cleanup/storage-locations')
@@ -444,7 +441,7 @@ describe('cleanup lifecycle', () => {
 
     vi.useFakeTimers()
     try {
-      const download = await storage.download(entryId)
+      const download = await storage.download(entryId).then((download) => download?.stream)
       expect(download).toBeDefined()
       download!.on('error', () => undefined)
       await db

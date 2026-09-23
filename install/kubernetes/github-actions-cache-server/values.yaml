@@ -45,6 +45,15 @@ config:
   # bucket. Doubles storage per entry until the parts cleanup job runs.
   eagerMerge: false
 
+  # -- Parallel ranged reads per proxied download of a merged object. 1 keeps a
+  # single storage stream. Raise it when one GET stream from the storage
+  # backend is slower than the path to the runners. Memory per download is
+  # about downloadConcurrency × downloadChunkBytes.
+  downloadConcurrency: 1
+
+  # -- Size of each ranged read when downloadConcurrency is above 1.
+  downloadChunkBytes: 8388608
+
   # -- Number of days to keep stale cache data before deleting it. Set to 0 to disable.
   cacheCleanupOlderThanDays: 90
 
